@@ -1,0 +1,56 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ProxyGate",
+  "version": "0.1.0",
+  "identifier": "com.proxygate.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "ProxyGate",
+        "width": 1140,
+        "height": 740,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "publisher": "LogueFX",
+    "copyright": "Copyright © 2026 LogueFX",
+    "homepage": "https://github.com/loguefx/ProxyGate",
+    "shortDescription": "Desktop reverse-proxy manager",
+    "longDescription": "ProxyGate is a cross-platform desktop reverse-proxy manager. Route incoming HTTP traffic by hostname to internal service groups with automatic health checking, load balancing, WebSocket support, and live access logs — all from a single native GUI.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "wix": {
+        "language": "en-US",
+        "upgradeCode": "8f3d1a2b-4c5e-6f7a-8b9c-0d1e2f3a4b5c"
+      },
+      "nsis": {
+        "languages": ["English"],
+        "displayLanguageSelector": false,
+        "installMode": "perMachine"
+      }
+    }
+  }
+}

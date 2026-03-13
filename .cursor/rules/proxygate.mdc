@@ -1,0 +1,843 @@
+---
+name: ProxyGate
+description: >
+  Complete rules, architecture, routing model, data models, GUI design spec,
+  and coding conventions for the ProxyGate desktop reverse-proxy manager.
+  (Tauri 2 + React 18 + TypeScript + Tailwind CSS + SQLite)
+globs:
+  - "src/**/*.{ts,tsx,css}"
+  - "src-tauri/**/*.{rs,toml}"
+  - "*.json"
+  - "*.toml"
+---
+
+# ProxyGate — Complete Project Rules
+
+---
+
+## 1. What ProxyGate Is
+
+ProxyGate is a cross-platform desktop GUI (Windows + Linux) that manages a reverse proxy.
+Core promise: users never touch a config file. They fill in forms, the app generates
+Traefik-compatible YAML under the hood and signals the proxy to reload.
+
+### The fundamental routing model
+
+ProxyGate has ONE public-facing IP address — e.g. 203.0.113.10.
+Every domain the user wants to proxy points to this single IP in DNS (Cloudflare or otherwise).
+ProxyGate reads the Host: header on every incoming HTTP request and routes it to the
+correct service group. Multiple completely different services (Jellyfin, Plex, a web app,
+an API) can all share the same public IP without conflict because the Host header
+distinguishes them.
+
+Analogy: A hotel has one street address. The receptionist reads your room number
+(the Host header) and sends you to the right floor. Different guests, same front door.
+
+---
+
+## 2. Core Concepts
+
+### Public IP
+The single IP address ProxyGate listens on. This is the ONLY IP ever put in DNS.
+Stored in app_settings as public_ip. Displayed prominently in the app topbar.
+
+### Route
+A rule that maps an incoming hostname + optional path prefix to a service group.
+
+  SUBDOMAIN match: jellyfin.example.com       → jellyfin group
+  PATH match:      example.com/api/*           → api group
+  PATH match:      example.com/shop/*          → shop group
+
+Multiple routes can share the same base domain with different path prefixes.
+They all use the same ProxyGate IP — no conflict.
+
+### Service Group
+A named pool of one or more backend upstream IP:port pairs.
+The group is the virtual destination for a route.
+ProxyGate health-checks each upstream independently every 30 seconds.
+If one upstream goes down, traffic automatically goes to the remaining healthy upstreams.
+The domain never goes down as long as ProxyGate is up AND at least one upstream is healthy.
+
+  jellyfin group:
+    192.168.1.10:8096  UP  12ms
+    192.168.1.11:8096  UP   9ms
+    → round-robin between both
+
+  plex group:
+    192.168.2.10:32400  DOWN  skipped
+    192.168.2.11:32400  UP    8ms
+    → all traffic to .11 while .10 is down
+
+The group has NO public IP. Cloudflare DNS points to ProxyGate's IP only.
+The upstream IPs are private/internal — never in DNS, never exposed to the internet.
+
+### Upstream
+A single IP:port entry inside a service group.
+Has its own health status, latency reading, and optional weight for weighted load balancing.
+
+### Host Header Routing (how separation works)
+Every HTTP/1.1 request includes a Host: header set by the browser to the domain the user typed.
+Even though all requests arrive on the same IP:443, ProxyGate reads this header to decide
+which route matches, and therefore which service group gets the request.
+This is standard HTTP behaviour since RFC 2616 (1997). It is how every major reverse proxy works.
+
+Example for two services on the same IP:
+  Request A: GET / HTTP/1.1  Host: jellyfin.example.com  → jellyfin group
+  Request B: GET / HTTP/1.1  Host: plex.example.com      → plex group
+  Both arrive at 203.0.113.10:443. ProxyGate separates them by reading Host.
+
+### Cloudflare DNS
+User creates A records in Cloudflare:
+  jellyfin.example.com  A  203.0.113.10
+  plex.example.com      A  203.0.113.10
+
+Both point to the SAME IP. No conflict. Cloudflare only knows the one public IP.
+ProxyGate does all the internal routing by Host header.
+
+Cloudflare orange-cloud (proxy mode): when enabled, Cloudflare puts its CDN in front.
+ProxyGate must then trust the CF-Connecting-IP header to get the real visitor IP.
+ProxyGate auto-writes Cloudflare's IP ranges into forwardedHeaders.trustedIPs in the
+generated Traefik config when the user enables "Cloudflare proxy mode" in settings.
+
+### Path Stripping
+When a route matches /api/*, the backend may expect requests at / not /api/.
+Path stripping removes the prefix before forwarding.
+Example: example.com/api/users → backend receives GET /users
+Configurable per route with a toggle. Always show a before/after preview when enabled.
+
+### Middleware
+A plugin applied per-route via checkboxes when creating/editing a route.
+Global enable/disable lives in the Middleware page.
+Per-route middleware list is stored as a JSON array of middleware IDs on the route.
+
+### TLS
+ProxyGate terminates TLS. Backends are plain HTTP internally (no certs on backend servers).
+Two modes:
+  ACME: auto-issue and renew via Let's Encrypt. Requires ports 80+443 accessible.
+  Manual: user uploads cert/key pair per domain.
+
+---
+
+## 3. Tech Stack
+
+  Desktop shell:  Tauri 2 (Rust backend + OS-native webview)
+  Frontend:       React 18 + TypeScript + Vite
+  Styling:        Tailwind CSS utility classes + CSS custom properties
+  State:          Zustand (one store per domain)
+  Database:       SQLite via tauri-plugin-sql
+  Config output:  Traefik v3 YAML (auto-generated, never hand-edited by user)
+  Proxy daemon:   Traefik v3 (spawned and managed by Tauri)
+  HA (optional):  keepalived VRRP for floating IP between two ProxyGate nodes
+
+---
+
+## 4. File Structure
+
+  src/
+    main.tsx
+    App.tsx
+    router.tsx
+    styles/
+      globals.css                  CSS custom properties dark palette
+
+    components/
+      layout/
+        AppShell.tsx               CSS grid: topbar + sidebar + main
+        Sidebar.tsx                Nav with active state and badges
+        Topbar.tsx                 Logo, public IP chip, status, restart button
+      ui/
+        Badge.tsx                  b-green b-blue b-amber b-red b-gray b-purple
+        Button.tsx                 primary ghost danger sm variants
+        Toggle.tsx                 pill switch
+        Modal.tsx                  overlay + focus trap + ESC close
+        Card.tsx                   dark card with border
+        Input.tsx                  text select monospace variants
+        HealthDot.tsx              animated green/red/gray dot
+        UpstreamRow.tsx            single upstream with health bar + actions
+
+    pages/
+      Dashboard.tsx                stats + recent requests + service health
+      Routes.tsx                   route table + add/edit modal
+      ServiceGroups.tsx            expandable group cards + inline upstream management
+      Middleware.tsx               toggle list per middleware plugin
+      TLS.tsx                      ACME settings + manual cert upload + cert table
+      Logs.tsx                     live log stream with filters
+      DNS.tsx                      Cloudflare DNS guide + trusted proxies config
+      Settings.tsx                 ports + public IP + HA config
+
+    store/
+      useRouteStore.ts
+      useServiceGroupStore.ts
+      useMiddlewareStore.ts
+      useTLSStore.ts
+      useSettingsStore.ts
+      useLogStore.ts
+
+    lib/
+      db.ts                        tauri-plugin-sql typed wrapper
+      configGen.ts                 generates Traefik v3 YAML from all store state
+      tauri.ts                     typed invoke() wrappers for all Rust commands
+      validation.ts                hostname URL port CIDR validators
+      cloudflareIPs.ts             Cloudflare trusted IP CIDR ranges
+
+  src-tauri/src/
+    main.rs
+    commands/
+      proxy.rs                     start_proxy stop_proxy reload_proxy get_status
+      config.rs                    write_config validate_config get_config_path
+      health.rs                    check_upstream_health(address) returns ms or error
+      logs.rs                      tail_logs via Tauri event emitter
+      certs.rs                     list_certs upload_cert delete_cert
+    db/
+      schema.sql
+      migrations/
+        001_initial.sql
+
+---
+
+## 5. Design System — Permanent Dark Mode
+
+### CSS Custom Properties (src/styles/globals.css)
+
+:root {
+  --bg0: #0d0f12;        app background
+  --bg1: #13161b;        sidebar cards modals
+  --bg2: #1a1e25;        input fields table hover
+  --bg3: #22272f;        nav badges icon wells
+  --bg4: #2a3040;        toggle track off disabled
+
+  --border:  #2a3040;    default separator
+  --border2: #333c4a;    button borders input borders
+
+  --text1: #e8eaf0;      primary headings important values
+  --text2: #8b93a8;      secondary table cells labels
+  --text3: #555e70;      muted column headers timestamps hints
+
+  --accent:      #3dd68c;              ProxyGate brand green
+  --accent-dim:  #1f4a35;
+  --accent-glow: rgba(61,214,140,0.15);
+
+  --blue:        #4d9eff;  --blue-dim:   #1a3a5c;
+  --purple:      #a78bfa;  --purple-dim: #2e1f5e;
+  --amber:       #f5a623;  --amber-dim:  #3d2a0a;
+  --red:         #f05252;  --red-dim:    #3d1010;
+  --coral:       #f97066;  --coral-dim:  #3d1810;
+
+  --radius:    8px;
+  --radius-lg: 12px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, 'SF Pro Display', 'Segoe UI', sans-serif;
+  background: var(--bg0);
+  color: var(--text1);
+}
+.mono { font-family: 'SF Mono','Fira Code','Cascadia Code',monospace; font-size: 12px; }
+
+### App Layout Grid
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  grid-template-rows: 52px 1fr;
+  height: 100vh;
+  overflow: hidden;
+}
+Topbar spans grid-column 1/-1.
+Sidebar: bg1, border-right 1px border.
+Main: bg0, overflow-y auto, padding 24px.
+
+### Component Tokens
+
+Cards:
+  background: var(--bg1)
+  border: 1px solid var(--border)
+  border-radius: var(--radius-lg)
+  overflow: hidden
+
+Inputs:
+  background: var(--bg2)
+  border: 1px solid var(--border2)
+  border-radius: var(--radius)
+  padding: 8px 12px
+  font-size: 12.5px
+  color: var(--text1)
+  focus: border-color accent + box-shadow 0 0 0 2px accent-glow
+
+Buttons:
+  Primary:  bg accent, border accent, color #0d1a12
+  Ghost:    bg transparent, border border2, color text2
+  Danger:   bg red-dim, border rgba(red 0.2), color red
+  hover primary -> #5de8a4
+  hover ghost   -> bg bg3 + text1
+
+Badges (10px 600 letter-spacing 0.04em border-radius 4px):
+  b-green:  bg accent-dim  text accent  border rgba(accent 0.2)
+  b-blue:   bg blue-dim    text blue    border rgba(blue 0.2)
+  b-amber:  bg amber-dim   text amber   border rgba(amber 0.2)
+  b-red:    bg red-dim     text red     border rgba(red 0.2)
+  b-purple: bg purple-dim  text purple  border rgba(purple 0.2)
+  b-gray:   bg bg3         text text3   border border2
+
+Toggle pill switch:
+  off: track bg4, knob text3
+  on:  track accent-dim border rgba(accent 0.3), knob accent
+  transition 0.2s
+
+Nav items:
+  Active:   bg bg2 + text1 + 3px accent bar (position absolute left edge)
+  Hover:    bg bg2 + text1
+  Inactive: text2
+
+Health dot (7px circle):
+  UP:      #3dd68c + pulse animation (opacity 1→0.4→1 2s infinite)
+  DOWN:    #f05252 static
+  UNKNOWN: text3 static
+
+Health bar:
+  4px tall, full-width container
+  track: bg3
+  fill: accent, width% = health score 0-100
+
+Monospace rule: ALL IP addresses, ports, paths, hostnames use .mono class.
+
+---
+
+## 6. Page-by-Page GUI Spec
+
+### Topbar
+Left:   SVG icon (green rect with cross) + "PROXY" + "GATE" (GATE in accent colour)
+Right:  Status chip (green pill: pulsing dot + "X routes active · Y upstreams")
+        Restart button (↻ icon button)
+        Notifications button
+
+### Sidebar
+Sections:
+  MAIN
+    ⊞  Dashboard
+    ⇄  Routes          badge: route count
+    ◉  Service groups  badge: group count
+  CONFIG
+    ⊙  DNS / Cloudflare
+    ⊕  Middleware
+    🔒  TLS / SSL
+  OBSERVE
+    ≡  Live logs
+    ⚙  Settings
+
+Active item: left 3px accent bar, bg bg2, text1.
+
+### Dashboard
+Row of 4 stat cards:
+  Active routes   (accent green value)
+  Service groups  (blue value)
+  Uptime %        (text1 value, "30d window" subtitle)
+  TLS certs       (amber value, "renew in Xd" subtitle)
+
+Two-column grid below:
+  Left card "Recent requests":
+    Last 5 log lines: coloured dot + mono path + "Xs ago"
+    "View all →" button
+
+  Right card "Service health":
+    One row per group: health dot + group name + upstream count + status badge
+    Any group with a DOWN upstream shows amber warning instead of green
+
+### Routes Page
+Header: "Routes" + "Map hostnames & paths → service groups" + "+ Add route" button
+
+Info banner (always shown):
+  ⓘ  Point all your domains to [PUBLIC_IP] in Cloudflare DNS.
+      ProxyGate routes by Host header — not by IP.  [DNS setup →]
+  Public IP is live from useSettingsStore.
+
+Table columns:
+  Match | Type | → Service group | TLS | Middleware | Strip | Status | Actions
+
+  Match:         monospace hostname+path
+  Type:          PATH badge (blue) or SUBDOMAIN badge (purple)
+  Service group: colour dot + monospace group name
+  TLS:           HTTPS green / HTTP amber / REDIRECT blue
+  Middleware:    comma list in text3
+  Strip:         YES green / NO gray
+  Status:        ON green / OFF gray — clicking toggles enabled
+  Actions:       Edit + Delete buttons
+
+Add/Edit Route modal — two tabs: "Subdomain" | "Path prefix"
+
+  Subdomain tab:
+    Hostname input          e.g. jellyfin.example.com
+    Service group dropdown  existing groups + "+ New group…"
+    TLS mode select
+    Middleware checkboxes
+
+  Path prefix tab:
+    Domain input            e.g. example.com
+    Path prefix input       e.g. /api or /shop
+    Strip prefix toggle     shows preview: "example.com/api/users → GET /users"
+    Service group dropdown
+    TLS mode select
+    Middleware checkboxes
+
+### Service Groups Page
+Header: "Service groups" + subtitle + "+ New service group" button
+
+Each group = expandable card.
+
+Collapsed header row:
+  [colour dot]  [name]  [X/Y up badge]  [LB method badge]  [N upstreams]  [▼/▶]
+
+Expanded body — two sections:
+
+  Section "Upstreams":
+    Per upstream row:
+      [health dot] [IP:port mono] [weight] [health bar] [Xms] [UP/DOWN badge] [Edit] [✕]
+    Below list — inline add form:
+      [IP:port input] [Weight select] [+ Add upstream button]
+
+  Section "Settings":
+    Load balancer select:  Round robin / Least connections / IP hash / Weighted
+    Health check path input
+    Check interval input
+    Timeout input
+    Passive health check toggle
+
+New service group modal:
+  Group name input
+  Load balancer select
+  Upstream list (one row to start, + button adds more rows)
+    Each row: IP:port input + weight select + remove button
+  Health check path + interval inputs
+  Colour picker (swatches: teal blue coral purple amber)
+
+### DNS / Cloudflare Page
+Section 1 — Public IP:
+  Editable input showing ProxyGate's public IP.
+  Label: "This is the only IP you put in all your DNS records."
+
+Section 2 — How Host header routing works:
+  Plain-language explanation card:
+  "All your domains point to this one IP. When a request arrives,
+  ProxyGate reads the Host header (e.g. jellyfin.example.com) and
+  routes it to the right service group. Multiple services share the
+  same IP — they are separated by hostname, not by IP address."
+
+Section 3 — Recommended DNS records table:
+  Type | Name              | Value        | Purpose
+  A    | example.com       | 203.0.113.10 | Root domain
+  A    | *.example.com     | 203.0.113.10 | All subdomains wildcard
+  A    | jellyfin.example  | 203.0.113.10 | Specific subdomain example
+  IP is interpolated from settings. Table is read-only / documentation style.
+
+Section 4 — Cloudflare proxy mode toggle:
+  "I'm using Cloudflare's orange cloud (proxy mode)"
+  When ON:
+    Explanation of CF-Connecting-IP trusted header
+    Status badge: "Trusted IPs configured ✓" — auto-written to generated config
+    No manual action required from user
+
+Section 5 — Amber warning banner:
+  "Your backend servers should only be reachable from ProxyGate's internal
+  IP, not from the internet. Block all backend ports from external access."
+
+### Middleware Page
+Toggle rows. Each row:
+  [icon well]  [Name]  [Description]  [pill toggle]
+
+Middleware list:
+  ⚡  Rate limiting        Max requests per IP per second
+  🔑  Basic auth           Require HTTP basic authentication
+  🌐  CORS headers         Cross-origin resource sharing
+  📦  Gzip compression     Compress responses automatically
+  🛡   IP whitelist         Allow only specified CIDR ranges
+  ↪   HTTP → HTTPS         Force all plain-HTTP to TLS
+  ✏   Custom headers       Inject or strip headers
+  ✂   Path stripping       Strip route prefix before forwarding
+
+Toggling a middleware with sub-config (rate limiting, IP whitelist, custom headers)
+expands an inline config row below the toggle row.
+
+### TLS / SSL Page
+Two option cards at top (clicking selects with accent border):
+  AUTO card:   "Let's Encrypt (ACME)" — auto-issue and renew
+  MANUAL card: "Custom certificates" — upload your own
+
+ACME settings form (shown when AUTO selected):
+  Email address input
+  Challenge type select: HTTP-01 / DNS-01 / TLS-ALPN-01
+
+Active certificates table:
+  Domain | Issuer | Expires | Days left | Status badge
+
+"+ Upload cert" in page header → modal with domain + cert PEM + key PEM fields.
+
+### Live Logs Page
+Filter bar: route dropdown + status class dropdown + Pause/Resume button
+
+Log stream (monospace, auto-scroll, max 200 DOM lines):
+  [timestamp]  [status]  [method]  [host+path]  [latency]
+  12:41:03     200       GET       jellyfin.example.com/web/   8ms
+  12:41:01     304       GET       plex.example.com/web/       3ms
+  12:40:58     500       POST      api.example.com/upload    102ms
+
+Status code colours:
+  2xx: accent green
+  3xx: blue
+  4xx: amber
+  5xx: red
+
+Implemented via Tauri listen('log-line', handler). Never polling.
+
+### Settings Page
+Network card:
+  HTTP port, HTTPS port, Admin API port, Log level
+
+Public IP card:
+  Single input for ProxyGate's public-facing IP
+  "This is the IP you put in all DNS records"
+
+Config export card:
+  Read-only path input showing generated YAML location
+  "Auto-generated — do not edit manually" notice
+
+High availability card (collapsible advanced section):
+  Enable HA toggle
+  This node: PRIMARY / SECONDARY selector
+  Floating VIP input (shared IP for keepalived)
+  Peer node IP input
+  Network interface input (e.g. eth0)
+  Explanation: "Run two ProxyGate instances. keepalived assigns the VIP
+  to whichever is healthy. Your domain points to the VIP and never changes."
+
+Buttons row: Save changes · Export config · Restart proxy
+
+---
+
+## 7. Data Models
+
+interface Route {
+  id: string
+  matchType: 'subdomain' | 'path'
+  hostname: string              // e.g. "jellyfin.example.com"
+  pathPrefix?: string           // e.g. "/api"  (path type only)
+  stripPathPrefix: boolean
+  serviceGroupId: string        // FK → ServiceGroup.id
+  tls: 'acme' | 'manual' | 'none' | 'redirect'
+  middleware: string[]          // e.g. ["rate-limit","gzip"]
+  enabled: boolean
+  createdAt: string
+}
+
+interface ServiceGroup {
+  id: string
+  name: string                  // e.g. "jellyfin" "plex" "api"
+  colour: string                // hex for dot in routes table
+  loadBalancer: 'round-robin' | 'least-conn' | 'ip-hash' | 'weighted'
+  healthCheckPath: string       // e.g. "/health"
+  healthCheckInterval: string   // e.g. "30s"
+  healthCheckTimeout: string    // e.g. "5s"
+  passiveHealthCheck: boolean
+  upstreams: Upstream[]
+  createdAt: string
+}
+
+interface Upstream {
+  id: string
+  serviceGroupId: string
+  address: string               // "192.168.1.10:8096"
+  weight: number                // 1-10 default 1
+  status: 'up' | 'down' | 'unknown'
+  latencyMs?: number
+  lastChecked?: string
+}
+
+interface MiddlewareConfig {
+  id: string                    // slug e.g. "rate-limit"
+  enabled: boolean
+  config: Record<string, unknown>
+}
+
+interface TLSConfig {
+  mode: 'acme' | 'manual'
+  acmeEmail?: string
+  acmeChallengeType?: 'HTTP-01' | 'DNS-01' | 'TLS-ALPN-01'
+  certs: CertEntry[]
+}
+
+interface CertEntry {
+  id: string
+  domain: string
+  certPath: string
+  keyPath: string
+  issuer: string
+  expiresAt: string
+  status: 'valid' | 'expiring' | 'expired'
+}
+
+interface AppSettings {
+  publicIp: string
+  httpPort: number
+  httpsPort: number
+  adminPort: number
+  logLevel: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
+  configOutputPath: string
+  cloudflareProxyEnabled: boolean
+  haEnabled: boolean
+  haRole: 'primary' | 'secondary'
+  haVip: string
+  haPeerIp: string
+  haInterface: string
+}
+
+---
+
+## 8. SQLite Schema
+
+CREATE TABLE routes (
+  id               TEXT PRIMARY KEY,
+  match_type       TEXT NOT NULL DEFAULT 'subdomain',
+  hostname         TEXT NOT NULL,
+  path_prefix      TEXT,
+  strip_path       INTEGER NOT NULL DEFAULT 0,
+  service_group_id TEXT NOT NULL REFERENCES service_groups(id),
+  tls              TEXT NOT NULL DEFAULT 'acme',
+  middleware       TEXT NOT NULL DEFAULT '[]',
+  enabled          INTEGER NOT NULL DEFAULT 1,
+  created_at       TEXT NOT NULL
+);
+
+CREATE TABLE service_groups (
+  id                    TEXT PRIMARY KEY,
+  name                  TEXT NOT NULL UNIQUE,
+  colour                TEXT NOT NULL DEFAULT '#3dd68c',
+  load_balancer         TEXT NOT NULL DEFAULT 'round-robin',
+  health_check_path     TEXT NOT NULL DEFAULT '/health',
+  health_check_interval TEXT NOT NULL DEFAULT '30s',
+  health_check_timeout  TEXT NOT NULL DEFAULT '5s',
+  passive_health_check  INTEGER NOT NULL DEFAULT 1,
+  created_at            TEXT NOT NULL
+);
+
+CREATE TABLE upstreams (
+  id               TEXT PRIMARY KEY,
+  service_group_id TEXT NOT NULL REFERENCES service_groups(id) ON DELETE CASCADE,
+  address          TEXT NOT NULL,
+  weight           INTEGER NOT NULL DEFAULT 1,
+  status           TEXT NOT NULL DEFAULT 'unknown',
+  latency_ms       INTEGER,
+  last_checked     TEXT,
+  created_at       TEXT NOT NULL
+);
+
+CREATE TABLE middleware_configs (
+  id      TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  config  TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE tls_config (
+  id                  INTEGER PRIMARY KEY DEFAULT 1,
+  mode                TEXT NOT NULL DEFAULT 'acme',
+  acme_email          TEXT,
+  acme_challenge_type TEXT DEFAULT 'HTTP-01',
+  certs               TEXT NOT NULL DEFAULT '[]'
+);
+
+CREATE TABLE app_settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+-- Default seeds
+INSERT OR IGNORE INTO app_settings VALUES
+  ('public_ip',''),('http_port','80'),('https_port','443'),
+  ('admin_port','8080'),('log_level','INFO'),
+  ('config_path','/etc/proxygate/traefik.yml'),
+  ('cf_proxy','false'),('ha_enabled','false'),
+  ('ha_role','primary'),('ha_vip',''),
+  ('ha_peer_ip',''),('ha_interface','eth0');
+
+INSERT OR IGNORE INTO middleware_configs VALUES
+  ('rate-limit',   0, '{"ratePerSecond":100}'),
+  ('basic-auth',   0, '{"users":[]}'),
+  ('cors',         0, '{"allowOrigins":["*"]}'),
+  ('gzip',         1, '{}'),
+  ('ip-whitelist', 0, '{"cidrs":[]}'),
+  ('https-redirect',1,'{}'),
+  ('custom-headers',0,'{"set":{},"remove":[]}');
+
+---
+
+## 9. Zustand Store Pattern
+
+Every store follows this structure:
+
+import { create } from 'zustand'
+import { db } from '../lib/db'
+import { regenerateConfig } from '../lib/configGen'
+import { invoke } from '../lib/tauri'
+
+Each store:
+  - loads from SQLite on mount
+  - mutations = store update + db.execute + regenerateConfig()
+  - optimistic: update state first, rollback on error
+  - exposes: data array, loading bool, load(), add(), update(), remove()
+
+useServiceGroupStore also has:
+  addUpstream(groupId, upstream)
+  removeUpstream(upstreamId)
+  refreshHealth()  -- pings all upstreams via invoke('check_upstream_health')
+
+Health refresh runs every 30s via setInterval at module level.
+
+---
+
+## 10. Config Generation (src/lib/configGen.ts)
+
+Called after EVERY store mutation. Users never manually trigger it.
+
+regenerateConfig():
+  1. Read all stores (routes, groups, middleware, tls, settings)
+  2. Call buildTraefikV3YAML() to produce YAML string
+  3. invoke('write_config', { yaml, path })
+  4. invoke('reload_proxy')
+
+buildTraefikV3YAML() produces:
+
+  Static config:
+    entryPoints: web(:80) websecure(:443)
+    certificatesResolvers if ACME mode
+    forwardedHeaders.trustedIPs if Cloudflare mode (uses cloudflareIPs.ts ranges)
+    api block if admin port set
+
+  Dynamic config (providers.file):
+    http.routers — one per enabled route
+      rule: Host(`jellyfin.example.com`)
+         or Host(`example.com`) && PathPrefix(`/api`)
+      middlewares: [array of middleware ids]
+      service: serviceGroupId
+      tls.certResolver: "letsencrypt" if ACME
+
+    http.services — one per service group
+      loadBalancer.servers: [{ url: "http://192.168.1.10:8096" }, ...]
+      loadBalancer.healthCheck: { path, interval, timeout }
+      loadBalancer.passiveHealthCheck if enabled
+
+    http.middlewares — one per enabled middleware with its config
+
+    tls.certificates — manual cert entries if manual mode
+
+---
+
+## 11. Tauri Commands
+
+proxy.rs:
+  start_proxy(app: AppHandle)
+  stop_proxy(app: AppHandle)
+  reload_proxy(app: AppHandle)       SIGHUP on Linux, API call on Windows
+  get_proxy_status()                 returns running bool + active route count
+
+config.rs:
+  write_config(yaml: String, path: String)
+  get_config_path(app: AppHandle)
+  validate_config(yaml: String)      runs traefik validate --configfile <tempfile>
+
+health.rs:
+  check_upstream_health(address: String) -> Result<u64, String>
+    HTTP HEAD to http://{address}/health  returns latency ms or Err
+
+logs.rs:
+  start_log_tail(app: AppHandle)
+    reads Traefik access log, emits Tauri events:
+    app.emit_all("log-line", LogLine { timestamp, status, method, host, path, latency_ms })
+
+certs.rs:
+  list_certs(dir: String) -> Vec<CertInfo>
+  upload_cert(domain: String, cert_pem: String, key_pem: String)
+  delete_cert(domain: String)
+
+---
+
+## 12. Validation (src/lib/validation.ts)
+
+validate.hostname(v)          RFC hostname regex
+validate.wildcardHostname(v)  allows *.example.com
+validate.upstreamAddress(v)   "ip:port" format, port 1-65535
+validate.port(v)              integer 1-65535
+validate.pathPrefix(v)        starts with / no wildcards
+validate.cidr(v)              x.x.x.x/n format
+validate.ipv4(v)              valid IPv4 all octets <= 255
+validate.email(v)             basic email regex
+validate.interval(v)          number + s/m/h suffix
+
+Show validation errors INLINE below the offending input in var(--red).
+Never use a toast for validation errors.
+
+---
+
+## 13. Coding Rules
+
+1.  TypeScript strict mode, zero any types
+2.  No raw config file editing in UI — path shown read-only in Settings only
+3.  Auto-regenerate config after EVERY store mutation, no manual apply button
+4.  Optimistic UI — update store immediately, rollback + show toast on Tauri error
+5.  All invoke() calls wrapped in try/catch, user sees toast on error
+6.  Max 200 lines per component, extract sub-components early
+7.  No inline styles — Tailwind classes or CSS custom properties only
+8.  Monospace class on ALL IP addresses, ports, paths, hostnames
+9.  Accessible — labels on all inputs, modals trap focus and close on ESC
+10. Health polling — setInterval in useServiceGroupStore, 30s, starts on mount
+11. Log streaming — Tauri listen() only, never polling
+12. Path strip preview — when strip toggle ON, always show:
+      "example.com/api/users → backend receives GET /users"
+13. Colour dot consistency — service group colour appears in:
+      group card dot, routes table dot, dashboard health list dot
+14. Status toggle in routes table — clicking ON/OFF immediately updates route.enabled
+      and calls regenerateConfig() without opening the edit modal
+15. "+ New group…" option in route modal service group dropdown — clicking it
+      closes the route modal and opens the new service group modal, then returns
+
+---
+
+## 14. Tauri Window Config
+
+{
+  "app": {
+    "windows": [{
+      "title": "ProxyGate",
+      "width": 1140,
+      "height": 740,
+      "minWidth": 960,
+      "minHeight": 640,
+      "resizable": true,
+      "center": true
+    }]
+  }
+}
+
+---
+
+## 15. Dev Setup
+
+npm create tauri-app@latest proxygate -- --template react-ts
+cd proxygate
+npm install zustand @tauri-apps/plugin-sql react-router-dom
+cargo add tauri-plugin-sql --features sqlite
+npm run tauri dev         hot reload both Rust and React
+npm run tauri build       outputs .msi (Windows) .deb/.AppImage (Linux)
+
+---
+
+## 16. High Availability (keepalived / VRRP)
+
+Architecture:
+  Domain DNS → Floating VIP 203.0.113.10
+  Floating VIP held by ProxyGate A (primary) normally
+  If A dies, keepalived on B claims VIP within ~1 second
+  Domain stays up, users notice nothing
+
+Both ProxyGate nodes run identical config (synced via rsync or shared NFS).
+HA panel in Settings generates /etc/keepalived/keepalived.conf.
+User provides: role, VIP, peer IP, network interface.
+ProxyGate writes the keepalived config — user never edits it manually.

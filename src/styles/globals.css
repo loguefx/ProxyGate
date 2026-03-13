@@ -1,0 +1,51 @@
+:root {
+  --bg0: #0d0f12;
+  --bg1: #13161b;
+  --bg2: #1a1e25;
+  --bg3: #22272f;
+  --bg4: #2a3040;
+  --border:  #2a3040;
+  --border2: #333c4a;
+  --text1: #e8eaf0;
+  --text2: #8b93a8;
+  --text3: #555e70;
+  --accent:      #3dd68c;
+  --accent-dim:  #1f4a35;
+  --accent-glow: rgba(61, 214, 140, 0.15);
+  --blue:        #4d9eff;  --blue-dim:   #1a3a5c;
+  --purple:      #a78bfa;  --purple-dim: #2e1f5e;
+  --amber:       #f5a623;  --amber-dim:  #3d2a0a;
+  --red:         #f05252;  --red-dim:    #3d1010;
+  --coral:       #f97066;  --coral-dim:  #3d1810;
+  --radius:    8px;
+  --radius-lg: 12px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { height: 100%; }
+
+body {
+  font-family: -apple-system, 'SF Pro Display', 'Segoe UI', sans-serif;
+  background: var(--bg0);
+  color: var(--text1);
+  overflow: hidden;
+}
+
+.mono {
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 12px;
+}
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}

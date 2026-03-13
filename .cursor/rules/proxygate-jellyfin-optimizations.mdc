@@ -1,0 +1,823 @@
+---
+name: ProxyGate — Jellyfin Optimizations
+description: >
+  Complete optimization spec for serving Jellyfin (and Plex) through ProxyGate
+  with zero buffering, instant playback, and no seek latency. Covers all 4 layers:
+  TLS/client, ProxyGate/Traefik config, Jellyfin server settings, and storage/network.
+  Generated config must be applied automatically when a Jellyfin service group is detected.
+globs:
+  - "src/lib/configGen.ts"
+  - "src/lib/appPresets.ts"
+  - "src/pages/ServiceGroups.tsx"
+  - "src/pages/DNS.tsx"
+  - "src-tauri/src/commands/config.rs"
+---
+
+# ProxyGate — Jellyfin & Media Server Optimizations
+
+---
+
+## Why media servers need special proxy treatment
+
+A standard reverse proxy config optimized for APIs and web apps will cause problems
+with media streaming. The reasons:
+
+1. PROXY BUFFERING — by default, Traefik buffers the full response body before forwarding
+   it to the client. For a 4K video file this means the proxy tries to hold gigabytes in
+   memory before the client sees a single byte. Result: long initial load, seek lag, crashes.
+
+2. SHORT TIMEOUTS — default HTTP timeouts are 30–60 seconds. A 2-hour movie stream is an
+   open HTTP connection for 2 hours. Default timeouts kill it mid-stream.
+
+3. MISSING HEADERS — Jellyfin requires X-Forwarded-Proto to know it is behind HTTPS.
+   Without it, Jellyfin generates HTTP URLs for assets, breaking playback on HTTPS clients.
+
+4. WEBSOCKET GAPS — Jellyfin uses WebSockets for SyncPlay (watch parties), real-time
+   notifications, and the dashboard. Without explicit WS upgrade support the connection
+   silently falls back to polling, causing lag.
+
+5. GZIP ON MEDIA — compressing already-compressed video/audio wastes 100% CPU and adds
+   latency. Gzip must be disabled for media MIME types and enabled only for text/JSON/HTML.
+
+6. BODY SIZE LIMITS — Traefik has a default max body size. Large file uploads (subtitles,
+   metadata images, plugins) will be rejected without an explicit override.
+
+---
+
+## Layer 1 — TLS and client connection
+
+### HTTP/2 (required)
+HTTP/2 multiplexes multiple requests over one TCP connection. Without it, the browser
+opens 6–8 separate TCP+TLS connections for Jellyfin's concurrent asset requests
+(poster art, audio, subtitle tracks, API calls). Each connection adds 1–3 RTTs of
+handshake overhead. HTTP/2 eliminates this.
+
+In generated Traefik config:
+```yaml
+entryPoints:
+  websecure:
+    address: ":443"
+    http2:
+      maxConcurrentStreams: 250
+    http:
+      middlewares:
+        - jellyfin-headers@file
+```
+
+### TLS 1.3 only for media routes
+TLS 1.3 has a 1-RTT handshake vs TLS 1.2's 2-RTT. For a user on the other side of the
+world this is the difference between 200ms and 400ms before the first byte arrives.
+
+```yaml
+tls:
+  options:
+    jellyfin-tls:
+      minVersion: VersionTLS13
+      sniStrict: true
+```
+
+### OCSP stapling
+Without OCSP stapling, the browser must make a separate request to Let's Encrypt's OCSP
+server to verify the certificate has not been revoked. This is a cold-path DNS lookup +
+TCP + TLS + HTTP round trip that adds 50–300ms to the FIRST connection from any new client.
+Traefik enables OCSP stapling automatically when using ACME — verify it is not disabled.
+
+### TLS session resumption
+For returning visitors (the common case — someone watching a long series), TLS session
+tickets allow the 0-RTT or 1-RTT resumption path. This is automatic in Traefik but
+requires the session ticket keys to NOT be rotated more than once per hour.
+
+---
+
+## Layer 2 — ProxyGate / Traefik config
+
+This is the MOST IMPORTANT layer. Misconfiguration here overrides everything else.
+
+### 2.1 Disable response buffering (CRITICAL)
+
+This is the single biggest source of "loading" lag for video streams.
+
+```yaml
+# src/lib/configGen.ts — buildTraefikV3YAML()
+# Add to the serversTransport section for any Jellyfin service group:
+
+http:
+  serversTransports:
+    jellyfin-transport:
+      respondingTimeouts:
+        readTimeout:  "6h"      # A 6-hour stream must not time out
+        writeTimeout: "6h"
+        idleTimeout:  "90s"
+      forwardingTimeouts:
+        dialTimeout:        "10s"
+        responseHeaderTimeout: "30s"
+        idleConnTimeout:    "90s"
+      maxIdleConnsPerHost: 200
+```
+
+In the router config for Jellyfin, reference this transport:
+```yaml
+http:
+  services:
+    jellyfin:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.10:8096"
+        responseForwarding:
+          flushInterval: "0ms"    # ← THE KEY SETTING
+                                  # 0ms = forward bytes immediately as received
+                                  # default is 100ms which causes buffering stutter
+        passHostHeader: true
+        serversTransport: jellyfin-transport
+```
+
+`flushInterval: "0ms"` tells Traefik to flush each chunk to the client the instant
+it receives it from Jellyfin. This eliminates the "waiting for server response" delay
+you see in browser devtools. Playback starts when the first HLS segment is ready,
+not when the entire response is buffered.
+
+### 2.2 Required headers middleware
+
+Jellyfin MUST see these headers or it malfunctions behind a proxy.
+
+```yaml
+http:
+  middlewares:
+    jellyfin-headers:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+          X-Real-IP: ""               # cleared so Traefik fills it from client IP
+        customResponseHeaders:
+          X-Content-Type-Options: "nosniff"
+          X-Frame-Options: "SAMEORIGIN"
+        hostsProxyHeaders:
+          - "X-Forwarded-Host"
+        realIPHeader: "X-Real-Ip"
+        trustedIPs:
+          - "127.0.0.1/8"
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+          - "192.168.0.0/16"
+```
+
+Without `X-Forwarded-Proto: https`, Jellyfin generates `http://` URLs for image
+and media assets even when the client is on HTTPS. The browser blocks mixed content
+and the player shows a black screen or broken thumbnails.
+
+### 2.3 WebSocket support
+
+Jellyfin uses WebSockets for:
+- SyncPlay (synchronized watching with multiple users)
+- Real-time dashboard activity (now playing, streams count)
+- Push notifications (new library items, transcoding progress)
+- Session activity updates in the web client
+
+Without explicit WS support these features silently fail or fall back to
+polling every 30 seconds, causing a noticeable delay in UI updates.
+
+```yaml
+http:
+  middlewares:
+    jellyfin-websocket:
+      headers:
+        customRequestHeaders:
+          Connection: "Upgrade"
+          Upgrade: "websocket"
+```
+
+Add both `jellyfin-headers` and `jellyfin-websocket` to the route's middlewares list.
+
+Traefik handles WebSocket upgrades automatically when the upstream sends a 101 response,
+but the Connection and Upgrade headers must be forwarded explicitly.
+
+### 2.4 Selective gzip — media vs API
+
+NEVER gzip media. Video, audio, and images are already compressed codecs (H.264, HEVC,
+AAC, FLAC, JPEG, WebP). Attempting to gzip them burns 100% of a CPU core, increases
+response size by ~1%, and adds 50–500ms of latency before the client receives data.
+
+DO gzip: JSON API responses, HTML, CSS, JavaScript, XML, subtitles (SRT/VTT/ASS).
+
+```yaml
+http:
+  middlewares:
+    jellyfin-compress:
+      compress:
+        excludedContentTypes:
+          - "video/mp4"
+          - "video/webm"
+          - "video/x-matroska"
+          - "video/mpeg"
+          - "video/ogg"
+          - "audio/mpeg"
+          - "audio/mp4"
+          - "audio/ogg"
+          - "audio/flac"
+          - "audio/x-flac"
+          - "audio/wav"
+          - "audio/aac"
+          - "image/jpeg"
+          - "image/png"
+          - "image/webp"
+          - "image/gif"
+          - "application/octet-stream"
+        minResponseBodyBytes: 1024
+```
+
+### 2.5 Remove body size limit
+
+Traefik has no default body size limit in v3, but the middleware must NOT have one
+applied. Jellyfin plugin uploads, subtitle file uploads, and metadata image uploads
+can be 50MB+. Ensure no `buffering` or `requestBodySize` middleware is on the route.
+
+```yaml
+# In configGen.ts — for Jellyfin routes, explicitly exclude the body-limit middleware
+# that may be applied globally to other routes
+```
+
+### 2.6 Connection keep-alive tuning
+
+Each new TCP connection to Jellyfin adds ~2ms overhead on a LAN.
+For a user scrubbing through a video (many rapid segment requests), this adds up.
+
+```yaml
+http:
+  serversTransports:
+    jellyfin-transport:
+      maxIdleConnsPerHost: 200   # pool of reusable connections to Jellyfin
+      # Traefik default is 200, but ensure it is not accidentally lowered
+```
+
+### 2.7 Full Traefik route block for Jellyfin
+
+This is what `configGen.ts` should output for a route whose service group
+has `appPreset: 'jellyfin'` set:
+
+```yaml
+http:
+
+  routers:
+    jellyfin:
+      rule: "Host(`jellyfin.example.com`)"
+      entryPoints:
+        - websecure
+      middlewares:
+        - jellyfin-headers
+        - jellyfin-websocket
+        - jellyfin-compress
+      service: jellyfin-svc
+      tls:
+        certResolver: letsencrypt
+        options: jellyfin-tls
+
+  services:
+    jellyfin-svc:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.10:8096"
+          - url: "http://192.168.1.11:8096"
+        healthCheck:
+          path: "/health"
+          interval: "30s"
+          timeout: "5s"
+        passiveHealthCheck:
+          consecutive5xxErrors: 3
+          interval: "30s"
+        responseForwarding:
+          flushInterval: "0ms"
+        passHostHeader: true
+        serversTransport: jellyfin-transport
+
+  middlewares:
+
+    jellyfin-headers:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: "https"
+        hostsProxyHeaders:
+          - "X-Forwarded-Host"
+        realIPHeader: "X-Real-Ip"
+
+    jellyfin-websocket:
+      headers:
+        customRequestHeaders:
+          Connection: "Upgrade"
+          Upgrade: "websocket"
+
+    jellyfin-compress:
+      compress:
+        excludedContentTypes:
+          - "video/mp4"
+          - "video/webm"
+          - "video/x-matroska"
+          - "audio/mpeg"
+          - "audio/mp4"
+          - "audio/flac"
+          - "audio/aac"
+          - "image/jpeg"
+          - "image/png"
+          - "image/webp"
+          - "application/octet-stream"
+        minResponseBodyBytes: 1024
+
+  serversTransports:
+    jellyfin-transport:
+      respondingTimeouts:
+        readTimeout:  "6h"
+        writeTimeout: "6h"
+        idleTimeout:  "90s"
+      forwardingTimeouts:
+        dialTimeout:            "10s"
+        responseHeaderTimeout:  "30s"
+        idleConnTimeout:        "90s"
+      maxIdleConnsPerHost: 200
+
+tls:
+  options:
+    jellyfin-tls:
+      minVersion: VersionTLS13
+      sniStrict: true
+```
+
+---
+
+## Layer 3 — Jellyfin server settings
+
+ProxyGate cannot control these — but the app SHOULD surface them as a
+"Jellyfin optimization checklist" in the Known Applications page.
+Show each item as a toggle with a status indicator that checks via the
+Jellyfin API whether the setting is currently enabled.
+
+### 3.1 Direct play — MOST IMPORTANT server setting
+
+Direct play means Jellyfin sends the original file bytes directly to the client
+with no processing. Zero CPU. Zero added latency. Playback starts in under 1 second.
+
+Transcoding means Jellyfin re-encodes the file in real time. This adds:
+- 2–10 seconds of startup delay while the transcode buffer fills
+- Continuous CPU/GPU usage
+- Seek lag (must re-start transcode from the nearest keyframe)
+
+The goal is: **client plays direct whenever possible, transcode only as fallback.**
+
+Settings in Jellyfin Admin → Playback:
+  Allow media playback that requires transcoding: ON (keep as fallback)
+  Allow video direct stream: ON
+  Allow video direct play: ON
+  Maximum allowed bitrate: 0 (unlimited) — CRITICAL, default 20Mbps blocks 4K
+
+### 3.2 Hardware transcoding
+
+When transcoding IS required (wrong codec, client can't handle HEVC, etc.),
+hardware transcoding reduces startup lag from 5–10s to 1–2s and eliminates
+the CPU bottleneck that causes stutter on concurrent streams.
+
+Jellyfin Admin → Playback → Transcoding:
+
+NVIDIA GPU (NVENC):
+  Hardware acceleration: NVENC
+  Enable hardware decoding for: H.264, HEVC, MPEG2, VC1, VP8, VP9, AV1
+  Enable hardware encoding: ON
+  NVENC options: Enable B-frames: ON, Enable lookahead: ON
+  Preset: P4 (balanced — good quality, fast encode start)
+  Tune: ll (low latency) for streaming
+
+Intel GPU (Quick Sync / VAAPI on Linux):
+  Hardware acceleration: VAAPI or QSV
+  Enable hardware decoding: all codecs
+  Low-power encoding: ON (uses less power, similar speed)
+  Prefer OS-native DXVA2/D3D11VA on Windows
+
+AMD GPU (VAAPI on Linux):
+  Hardware acceleration: VAAPI
+  Enable hardware decoding: H.264, HEVC, VP9
+
+No GPU:
+  Hardware acceleration: None
+  Encoding threads: leave at 0 (auto — uses all cores)
+  Enable throttle transcodes: ON (prevents runaway CPU if many streams start at once)
+
+### 3.3 HLS segment size and transcode buffer
+
+HLS (HTTP Live Streaming) is how Jellyfin delivers transcoded video.
+It cuts the video into segments and sends them one at a time.
+
+Jellyfin Admin → Playback → Transcoding:
+  Segment length: 3 (seconds) — smaller segments = faster seek response
+                                 default is 3, do NOT increase it
+  Allow on-demand metadata-based seeking: ON — seeks within already-downloaded
+                                              segments without re-requesting the server
+  Transcode path: set to a fast SSD, NOT a network share or HDD
+
+The transcode output directory should be on the FASTEST storage available,
+separate from the media library. It is temp space only and can be cleared safely.
+
+### 3.4 Remuxing preference
+
+Remuxing = changing the container format (e.g. MKV → MP4) without re-encoding the video.
+This is much faster than transcoding because the video and audio streams are copied as-is.
+Remux startup time: ~300ms. Transcode startup time: 2–10s.
+
+Jellyfin Admin → Playback:
+  Allow video direct stream: ON — enables remux when codec is compatible but container is not
+
+### 3.5 Network bandwidth setting
+
+Jellyfin throttles its own output if the network setting is too low.
+
+Jellyfin Admin → Playback:
+  Maximum internet streaming bitrate: 0 (unlimited)
+  Maximum LAN streaming bitrate: 0 (unlimited)
+
+A 4K HDR HEVC stream at high bitrate requires 60–120 Mbps. If this is capped at
+the old default of 20Mbps, 4K will always transcode down even if the client
+can handle the original.
+
+### 3.6 Codec priority order
+
+Jellyfin Admin → Playback → Transcoding → Codec priority:
+  Move H.264 and HEVC to the top of the preferred codec list.
+  Modern clients (browsers, Apple TV, Roku, Fire TV) support H.264 natively for direct play.
+  HEVC (H.265) is supported natively on Apple devices and newer smart TVs.
+  AV1 — enable if your hardware supports it; newer clients handle it natively.
+
+Priority order recommendation:
+  1. H.264 (universal support, direct play on everything)
+  2. HEVC/H.265 (direct play on Apple + newer TVs)
+  3. AV1 (best compression, direct play on Chrome + Firefox + modern TVs)
+  4. VP9 (fallback for older browsers)
+  5. MPEG-4 (legacy fallback)
+
+### 3.7 Subtitle rendering
+
+Subtitles are a hidden source of forced transcoding.
+
+Image-based subtitles (PGS, VOBSUB, DVB) CANNOT be streamed directly — Jellyfin
+must burn them into the video via transcode, even if the video codec is otherwise
+compatible for direct play. This turns a 300ms remux start into a 5–10s transcode.
+
+Recommendations:
+  Prefer text subtitle formats (SRT, ASS, SSA) in your media library when possible.
+  Jellyfin Admin → Playback: Allow extraction of image-based subtitles: ON
+    (Jellyfin converts PGS to text on first play — subsequent plays are direct)
+  Install jellyfin-ffmpeg with subtitle support compiled in.
+
+---
+
+## Layer 4 — Storage and network
+
+### 4.1 Storage speed hierarchy
+
+NVMe SSD > SATA SSD > HDD RAID > single HDD > network share
+
+For the media library (read-only during streaming):
+  Any disk type is fine for 1080p (reads ~40–100 Mbps sequential)
+  4K HDR requires ~100–150 Mbps sustained reads — HDDs can handle this for 1–2 streams
+  For 3+ concurrent 4K streams: SSD strongly recommended
+
+For the transcode temp directory:
+  Must be fast random write + fast random read (seek operations)
+  NVMe SSD ideal. Never use a network share (NFS, SMB) for transcode temp.
+  Location: /tmp/jellyfin-transcodes or a dedicated SSD partition
+
+### 4.2 RAM as read cache (optional but impactful)
+
+Linux page cache automatically caches recently-read files in free RAM.
+If a movie is watched regularly it will be served from RAM (~microseconds) not disk (~milliseconds).
+
+For servers with 32GB+ RAM:
+  No configuration needed — Linux does this automatically.
+  Ensure you are NOT using a swap file on the media drive (kills sequential reads).
+
+Optional: use `vmtouch` to pin specific media files permanently in RAM:
+  vmtouch -t /media/shows/popular-series/  # pin a whole series in RAM
+
+### 4.3 LAN bandwidth
+
+Streaming one 4K HDR HEVC file at original quality:
+  Bitrate: 60–120 Mbps
+  Per stream: needs 100Mbps reliable bandwidth between Jellyfin server and ProxyGate
+
+Recommendations:
+  Use wired Ethernet (Cat5e minimum, Cat6 preferred) between media server and router.
+  Never use Wi-Fi for the media server — even Wi-Fi 6 has variable throughput.
+  ProxyGate and Jellyfin server on the same switch = best latency (sub-1ms).
+
+For multiple concurrent 4K streams: Gigabit switch required. 100Mbps switches will bottleneck.
+
+### 4.4 Jumbo frames (advanced, optional)
+
+Jumbo frames increase MTU from 1500 to 9000 bytes on LAN.
+Each network packet carries 6× as much data, reducing the number of interrupts
+and CPU overhead for large file transfers like video streaming.
+
+Only effective if ALL devices on the path support it:
+  Jellyfin server NIC: MTU 9000
+  ProxyGate server NIC: MTU 9000
+  All switches on the path: jumbo frames enabled
+
+Linux: ip link set eth0 mtu 9000
+Persistent: add MTU=9000 to the NetworkManager connection or /etc/systemd/network/
+
+Do NOT enable if any device on the path does not support jumbo frames — it will
+fragment packets and make performance WORSE.
+
+---
+
+## Implementation in ProxyGate
+
+### app presets system (src/lib/appPresets.ts)
+
+ProxyGate should ship with pre-configured optimization presets for known apps.
+When a user selects "Jellyfin" as the app type when creating a service group,
+the preset is automatically applied to the generated Traefik config.
+
+```typescript
+// src/lib/appPresets.ts
+
+export type AppPreset = 'jellyfin' | 'plex' | 'generic' | 'api' | 'static'
+
+export interface PresetConfig {
+  flushInterval: string
+  readTimeout: string
+  writeTimeout: string
+  idleTimeout: string
+  maxIdleConnsPerHost: number
+  excludeGzipMimeTypes: string[]
+  requiredRequestHeaders: Record<string, string>
+  websocketSupport: boolean
+  tlsMinVersion: string
+  noBodySizeLimit: boolean
+  healthCheckPath: string
+}
+
+export const APP_PRESETS: Record<AppPreset, PresetConfig> = {
+
+  jellyfin: {
+    flushInterval: '0ms',               // stream immediately, no buffering
+    readTimeout: '6h',                  // long streams
+    writeTimeout: '6h',
+    idleTimeout: '90s',
+    maxIdleConnsPerHost: 200,
+    excludeGzipMimeTypes: [
+      'video/mp4', 'video/webm', 'video/x-matroska', 'video/mpeg', 'video/ogg',
+      'audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/flac', 'audio/aac',
+      'image/jpeg', 'image/png', 'image/webp', 'image/gif',
+      'application/octet-stream',
+    ],
+    requiredRequestHeaders: {
+      'X-Forwarded-Proto': 'https',
+    },
+    websocketSupport: true,
+    tlsMinVersion: 'VersionTLS13',
+    noBodySizeLimit: true,
+    healthCheckPath: '/health',
+  },
+
+  plex: {
+    flushInterval: '0ms',               // same as jellyfin — streaming
+    readTimeout: '6h',
+    writeTimeout: '6h',
+    idleTimeout: '90s',
+    maxIdleConnsPerHost: 200,
+    excludeGzipMimeTypes: [
+      'video/mp4', 'video/webm', 'audio/mpeg', 'audio/mp4',
+      'image/jpeg', 'image/png', 'application/octet-stream',
+    ],
+    requiredRequestHeaders: {
+      'X-Forwarded-Proto': 'https',
+      'X-Plex-Protocol': '1.0',
+    },
+    websocketSupport: true,
+    tlsMinVersion: 'VersionTLS13',
+    noBodySizeLimit: true,
+    healthCheckPath: '/identity',       // Plex uses /identity not /health
+  },
+
+  api: {
+    flushInterval: '100ms',             // APIs benefit from slight buffering for small responses
+    readTimeout: '30s',
+    writeTimeout: '30s',
+    idleTimeout: '60s',
+    maxIdleConnsPerHost: 100,
+    excludeGzipMimeTypes: [],           // compress everything for APIs
+    requiredRequestHeaders: {},
+    websocketSupport: false,
+    tlsMinVersion: 'VersionTLS12',
+    noBodySizeLimit: false,
+    healthCheckPath: '/health',
+  },
+
+  static: {
+    flushInterval: '100ms',
+    readTimeout: '30s',
+    writeTimeout: '30s',
+    idleTimeout: '60s',
+    maxIdleConnsPerHost: 50,
+    excludeGzipMimeTypes: [
+      'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/ico',
+      'font/woff', 'font/woff2',
+    ],
+    requiredRequestHeaders: {},
+    websocketSupport: false,
+    tlsMinVersion: 'VersionTLS12',
+    noBodySizeLimit: false,
+    healthCheckPath: '/',
+  },
+
+  generic: {
+    flushInterval: '100ms',
+    readTimeout: '60s',
+    writeTimeout: '60s',
+    idleTimeout: '60s',
+    maxIdleConnsPerHost: 100,
+    excludeGzipMimeTypes: [
+      'image/jpeg', 'image/png', 'image/webp', 'application/octet-stream',
+    ],
+    requiredRequestHeaders: {},
+    websocketSupport: false,
+    tlsMinVersion: 'VersionTLS12',
+    noBodySizeLimit: false,
+    healthCheckPath: '/',
+  },
+}
+```
+
+### Integration in configGen.ts
+
+```typescript
+// In buildTraefikV3YAML(), when generating a service group:
+
+import { APP_PRESETS, AppPreset } from './appPresets'
+
+function buildServiceConfig(group: ServiceGroup): string {
+  const preset = APP_PRESETS[group.appPreset ?? 'generic']
+
+  return `
+  serversTransports:
+    ${group.id}-transport:
+      respondingTimeouts:
+        readTimeout:  "${preset.readTimeout}"
+        writeTimeout: "${preset.writeTimeout}"
+        idleTimeout:  "${preset.idleTimeout}"
+      forwardingTimeouts:
+        dialTimeout:            "10s"
+        responseHeaderTimeout:  "30s"
+        idleConnTimeout:        "${preset.idleTimeout}"
+      maxIdleConnsPerHost: ${preset.maxIdleConnsPerHost}
+
+  services:
+    ${group.id}:
+      loadBalancer:
+        servers: ${group.upstreams.filter(u => u.status !== 'down')
+          .map(u => `\n          - url: "http://${u.address}"`).join('')}
+        responseForwarding:
+          flushInterval: "${preset.flushInterval}"
+        passHostHeader: true
+        serversTransport: ${group.id}-transport
+        healthCheck:
+          path: "${group.healthCheckPath ?? preset.healthCheckPath}"
+          interval: "${group.healthCheckInterval}"
+          timeout: "${group.healthCheckTimeout}"
+  `
+}
+```
+
+### Data model update — add appPreset to ServiceGroup
+
+```typescript
+// Add to ServiceGroup interface in src/lib/types.ts:
+interface ServiceGroup {
+  // ... existing fields ...
+  appPreset: 'jellyfin' | 'plex' | 'generic' | 'api' | 'static'
+}
+```
+
+```sql
+-- Add migration: src-tauri/src/db/migrations/002_add_app_preset.sql
+ALTER TABLE service_groups ADD COLUMN app_preset TEXT NOT NULL DEFAULT 'generic';
+```
+
+### UI — app preset selector in new service group modal
+
+In the "New service group" modal (src/pages/ServiceGroups.tsx), add an
+"App type" field above the name field:
+
+```
+App type: [Jellyfin] [Plex] [API] [Static site] [Generic]
+          ^^^^^^^^^^^
+          Selected = accent border, shows optimization badge "Optimized for streaming"
+```
+
+When Jellyfin or Plex is selected:
+  Show a green info box:
+  "Streaming optimizations applied: no buffering, 6h timeouts, WebSocket support,
+   media MIME types excluded from gzip, unlimited body size."
+
+When the user selects Jellyfin, also pre-fill:
+  Health check path: /health
+  Load balancer: Round robin
+  Check interval: 30s
+
+---
+
+## Known applications page (src/pages/KnownApps.tsx)
+
+Add a new page in the sidebar under CONFIG:
+  "Known apps" or "App guides"
+
+This page shows optimization checklists for each supported app.
+Each app card has:
+  - App name + icon
+  - Required Jellyfin settings to change (deep-linked to the right admin page)
+  - Status indicators (if reachable via the service group URL, check via API)
+
+### Jellyfin checklist card
+
+Display these items with green/red/amber status indicators.
+Check the Jellyfin API at /System/Info (no auth needed) to detect version,
+and /System/Configuration (requires API key) to read settings.
+
+Checklist items:
+  [ ] Max bitrate = unlimited (0)          — checks /System/Configuration.RemoteClientBitrateLimit
+  [ ] Hardware acceleration enabled        — checks /System/Configuration.HardwareAccelerationType
+  [ ] Direct play allowed                  — checks /System/Configuration.EnableOriginalTrackTitles
+  [ ] Allow direct stream (remux)          — checks playback config
+  [ ] Transcode temp on fast storage       — informational, shows configured path
+  [ ] BaseURL configured correctly         — checks /System/Configuration.BaseUrl
+
+Required Jellyfin setting (MUST SHOW THIS):
+  Jellyfin Admin → Networking → Base URL: set to empty or "/"
+  DO NOT set BaseURL unless Jellyfin is hosted at a subpath like example.com/jellyfin
+  If BaseURL is set incorrectly, all API calls return 404 even though the proxy is correct.
+
+  Also in Jellyfin Admin → Networking:
+    Known proxies: add ProxyGate's internal IP (e.g. 192.168.0.1)
+    Allow remote connections: ON
+    Enable automatic port mapping: OFF (not needed behind a proxy)
+
+### API key management (optional enhancement)
+
+In the service group settings for a Jellyfin group, add an optional
+"API key" field. If filled in, ProxyGate can:
+  - Show live stream count in the dashboard (active sessions)
+  - Show which users are currently watching
+  - Show transcode vs direct play ratio
+  - Surface the optimization checklist with real status values
+
+API endpoint: GET /Sessions?api_key={key}
+Returns: array of active sessions with PlayMethod (DirectPlay, DirectStream, Transcode)
+
+---
+
+## Summary — what to implement in ProxyGate
+
+Priority order:
+
+1. IMMEDIATE — in configGen.ts:
+   a. flushInterval: "0ms" for ALL service groups (not just Jellyfin)
+      This fixes the most common streaming complaint with zero downside for other apps.
+   b. Increase default timeouts: readTimeout 60s → 6h, writeTimeout 60s → 6h
+      Default 60s kills any stream over 1 minute long.
+
+2. HIGH — app preset system:
+   a. Add appPreset field to ServiceGroup data model + DB migration
+   b. Add app type selector to new/edit service group modal
+   c. Generate preset-specific Traefik config in configGen.ts
+   d. Show "Optimized for streaming" badge on Jellyfin/Plex groups
+
+3. MEDIUM — known apps page:
+   a. Jellyfin checklist with the required Networking settings
+   b. Plex checklist with reverse proxy header requirements
+   c. Settings that users must change ON JELLYFIN SIDE (ProxyGate cannot change these)
+
+4. LOW — live monitoring (requires API key):
+   a. Active stream count per service group
+   b. DirectPlay vs transcode ratio indicator
+   c. Hardware transcode utilization (if Jellyfin API exposes it)
+
+---
+
+## Plex-specific notes (same proxy principles, different settings)
+
+Plex also benefits from all Layer 2 proxy optimizations (flushInterval 0ms, long timeouts,
+WebSocket support). The main differences:
+
+Required headers for Plex:
+```yaml
+customRequestHeaders:
+  X-Forwarded-Proto: "https"
+  X-Plex-Protocol: "1.0"
+```
+
+Plex health check path: /identity (not /health)
+Returns: XML with machine identifier, no auth required.
+
+Plex network settings (Plex Web → Settings → Remote Access):
+  Custom server access URLs: https://plex.example.com:443
+  Disable relay: ON (prevents Plex from routing through plex.tv's relay servers)
+  LAN Networks: add your LAN CIDR (e.g. 192.168.0.0/24) so local clients get LAN speeds
+
+Plex does NOT need a BaseURL setting. It uses the X-Forwarded-* headers to detect
+the proxy and adjust URL generation automatically.
