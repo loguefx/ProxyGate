@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  build-windows:
+    name: Build Windows installer
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artefacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'ProxyGate ${{ github.ref_name }}'
+          releaseBody: |
+            ## ProxyGate ${{ github.ref_name }}
+
+            ### Installation
+            - **Windows:** Download `ProxyGate_*_x64_en-US.msi` (Windows Installer) or `ProxyGate_*_x64-setup.exe` (NSIS wizard)
+            - Run the installer — no administrator rights required
+
+            ### Changelog
+            See [CHANGELOG](https://github.com/loguefx/ProxyGate/blob/main/CHANGELOG.md) or [commit history](https://github.com/loguefx/ProxyGate/commits/main) for what changed in this release.
+          releaseDraft: false
+          prerelease: false
+          includeDebug: false
+          includeRelease: true
