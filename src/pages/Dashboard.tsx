@@ -2,7 +2,6 @@ import { useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useRouteStore } from '../store/useRouteStore'
 import { useServiceGroupStore } from '../store/useServiceGroupStore'
-import { useTLSStore } from '../store/useTLSStore'
 import { useLogStore } from '../store/useLogStore'
 import HealthDot from '../components/ui/HealthDot'
 import Badge from '../components/ui/Badge'
@@ -55,16 +54,9 @@ export default function Dashboard() {
   const navigate = useNavigate()
   const routes = useRouteStore(s => s.routes)
   const groups = useServiceGroupStore(s => s.groups)
-  const tls = useTLSStore(s => s.config)
   const logLines = useLogStore(s => s.lines)
 
   const activeRoutes = routes.filter(r => r.enabled).length
-  const certCount = tls.certs.length
-
-  const nextExpiry = tls.certs.reduce<number | null>((min, c) => {
-    const days = Math.ceil((new Date(c.expiresAt).getTime() - Date.now()) / 86_400_000)
-    return min === null ? days : Math.min(min, days)
-  }, null)
 
   const totalUpstreams = groups.reduce((a, g) => a + g.upstreams.length, 0)
   const downUpstreams = groups.reduce(
