@@ -385,23 +385,7 @@ async fn proxy_handler(
 
 /// Emit a log entry to the broadcast channel (non-fatal if no subscribers).
 fn emit_log(mgr: &Arc<ProxyManager>, start: Instant, status: u16, method: &str, host: &str, path: &str) {
-    // #region agent log - H-D: proxy handler reached emit_log
-    {
-        use std::io::Write;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-            .open("C:\\Users\\Logan\\Documents\\ProxyGate\\debug-f9f24b.log")
-        {
-            let _ = writeln!(f,
-                r#"{{"sessionId":"f9f24b","location":"proxy.rs:emit_log","message":"emit_log called","data":{{"status":{status},"method":"{method}","host":"{host}","path":"{path}","hypothesisId":"H-D"}},"timestamp":{ts}}}"#);
-        }
-    }
-    // #endregion
-
-    let result = mgr.log_tx.send(LogLine {
+    let _ = mgr.log_tx.send(LogLine {
         timestamp: Utc::now().to_rfc3339(),
         status,
         method: method.to_string(),
@@ -409,24 +393,6 @@ fn emit_log(mgr: &Arc<ProxyManager>, start: Instant, status: u16, method: &str, 
         path: path.to_string(),
         latency_ms: start.elapsed().as_millis() as u64,
     });
-
-    // #region agent log - H-E: broadcast send result
-    {
-        use std::io::Write;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-            .open("C:\\Users\\Logan\\Documents\\ProxyGate\\debug-f9f24b.log")
-        {
-            let ok = result.is_ok();
-            let receivers = result.as_ref().map(|n| *n as i64).unwrap_or(-1);
-            let _ = writeln!(f,
-                r#"{{"sessionId":"f9f24b","location":"proxy.rs:emit_log","message":"broadcast send result","data":{{"ok":{ok},"receiverCount":{receivers},"hypothesisId":"H-E"}},"timestamp":{ts}}}"#);
-        }
-    }
-    // #endregion
 }
 
 /// Shorthand for early-return responses that also emit a log entry.
