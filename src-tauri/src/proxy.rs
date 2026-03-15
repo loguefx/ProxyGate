@@ -133,9 +133,19 @@ impl ProxyManager {
     }
 
     /// Update the live config; restart server if port changed or not yet running.
-    pub async fn reload(self: &Arc<Self>, new_config: ProxyConfig) {
+    pub async fn reload(self: &Arc<Self>, mut new_config: ProxyConfig) {
         let new_port = new_config.http_port;
         let old_port = self.port.load(Ordering::Relaxed) as u16;
+
+        // Reset passive health marks — "down" is a runtime observation, not a
+        // persistent state. Every config reload gives all upstreams a clean start.
+        for group in new_config.service_groups.iter_mut() {
+            for upstream in group.upstreams.iter_mut() {
+                if upstream.status == "down" {
+                    upstream.status = "unknown".to_string();
+                }
+            }
+        }
 
         {
             let mut cfg = self.config.write().await;
@@ -144,6 +154,30 @@ impl ProxyManager {
 
         if new_port != old_port || !self.running.load(Ordering::Relaxed) {
             self.restart_server(new_port).await;
+        }
+    }
+
+    /// Mark an upstream as "up" in the live in-memory config.
+    /// Called by the health-check command when a probe succeeds.
+    pub async fn mark_upstream_up(self: &Arc<Self>, address: &str) {
+        let normalized = address
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_end_matches('/');
+
+        let mut cfg = self.config.write().await;
+        for group in cfg.service_groups.iter_mut() {
+            for upstream in group.upstreams.iter_mut() {
+                let addr = upstream
+                    .address
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://")
+                    .trim_end_matches('/');
+                if addr == normalized {
+                    upstream.status = "up".to_string();
+                    eprintln!("[ProxyGate] Health check: marked upstream {} as up", upstream.address);
+                }
+            }
         }
     }
 
@@ -570,7 +604,7 @@ async fn forward(
 }
 
 /// Mark an upstream as "down" in the live in-memory config.
-/// The health-check loop will restore it when the upstream recovers.
+/// The health-check command will restore it when the upstream recovers.
 async fn mark_upstream_down(mgr: &Arc<ProxyManager>, failed_addr: &str) {
     let normalized = failed_addr
         .trim_start_matches("http://")
