@@ -86,7 +86,7 @@ export default function TLS() {
         domain,
         certPath,
         keyPath,
-        issuer: info?.issuer ?? certForm.issuer.trim() || 'Manual',
+        issuer: info?.issuer ?? (certForm.issuer.trim() || 'Manual'),
         expiresAt: info?.expiresAt ?? new Date(Date.now() + 365 * 86_400_000).toISOString(),
         status: (info?.status as CertEntry['status']) ?? 'valid',
       }
