@@ -35,6 +35,20 @@ jobs:
       - name: Install Node dependencies
         run: npm ci
 
+      - name: Cargo check (surface Rust errors)
+        working-directory: ./src-tauri
+        shell: pwsh
+        run: |
+          cargo check 2>&1 | Tee-Object -FilePath ../cargo_check.log
+          exit $LASTEXITCODE
+
+      - name: Upload cargo check log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-check-log
+          path: cargo_check.log
+
       - name: Build and release
         uses: tauri-apps/tauri-action@v0
         env:
