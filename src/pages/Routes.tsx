@@ -10,6 +10,7 @@ import Badge from '../components/ui/Badge'
 import Button from '../components/ui/Button'
 import Modal from '../components/ui/Modal'
 import Toggle from '../components/ui/Toggle'
+import { useToast } from '../store/useToastStore'
 
 type TabType = 'subdomain' | 'path'
 
@@ -73,6 +74,7 @@ export default function Routes() {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [form, setForm] = useState<RouteForm>(EMPTY_FORM)
   const [errors, setErrors] = useState<Partial<Record<keyof RouteForm, string>>>({})
+  const toast = useToast()
 
   function openAdd() {
     setEditingId(null)
@@ -124,13 +126,18 @@ export default function Routes() {
       middleware: form.middleware,
       enabled: true,
     }
-    if (editingId) {
-      await updateRoute(editingId, routeData)
-    } else {
-      await addRoute(routeData)
+    try {
+      if (editingId) {
+        await updateRoute(editingId, routeData)
+        toast.success(`Route updated — ${routeData.hostname}`)
+      } else {
+        await addRoute(routeData)
+        toast.success(`Route created — ${routeData.hostname}`)
+      }
+      setModalOpen(false)
+    } catch (e) {
+      toast.error(`Failed to save route: ${e}`)
     }
-    setModalOpen(false)
-  }
 
   function handleNewGroup() {
     setModalOpen(false)

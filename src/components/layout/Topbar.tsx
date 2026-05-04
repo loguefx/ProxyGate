@@ -3,6 +3,7 @@ import { useRouteStore } from '../../store/useRouteStore'
 import { useServiceGroupStore } from '../../store/useServiceGroupStore'
 import { getProxyStatus } from '../../lib/tauri'
 import { regenerateConfig } from '../../lib/configGen'
+import { useToast } from '../../store/useToastStore'
 
 export default function Topbar() {
   const routes = useRouteStore(s => s.routes)
@@ -15,6 +16,7 @@ export default function Topbar() {
   const [proxyPort, setProxyPort] = useState<number | null>(null)
   const [proxyError, setProxyError] = useState<string | null>(null)
   const [restarting, setRestarting] = useState(false)
+  const toast = useToast()
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -39,6 +41,9 @@ export default function Topbar() {
     try {
       await regenerateConfig()
       await refreshStatus()
+      toast.success('Proxy config reloaded')
+    } catch (e) {
+      toast.error(`Reload failed: ${e}`)
     } finally {
       setRestarting(false)
     }
@@ -83,7 +88,7 @@ export default function Topbar() {
           padding: '2px 7px',
           borderRadius: '4px',
           letterSpacing: '0.02em',
-        }}>v0.1.0</span>
+        }}>v0.2.4</span>
       </div>
 
       {/* Right: Status + Actions */}

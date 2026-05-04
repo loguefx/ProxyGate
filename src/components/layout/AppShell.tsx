@@ -1,6 +1,7 @@
 import { Outlet } from 'react-router-dom'
 import Topbar from './Topbar'
 import Sidebar from './Sidebar'
+import Toaster from '../ui/Toaster'
 
 export default function AppShell() {
   return (
@@ -34,6 +35,7 @@ export default function AppShell() {
       }}>
         <Outlet />
       </main>
+      <Toaster />
     </div>
   )
 }
