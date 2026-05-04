@@ -1,6 +1,6 @@
 [package]
 name = "proxygate"
-version = "0.1.1"
+version = "0.2.0"
 description = "ProxyGate — Desktop Reverse Proxy Manager"
 authors = ["ProxyGate"]
 edition = "2021"
@@ -25,4 +25,17 @@ http = "1"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
+
+# TLS / HTTPS support
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+instant-acme = "0.7"
+rcgen = "0.13"
+x509-parser = "0.16"
+
+# Low-level HTTP serving for the TLS accept loop
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.4"
 

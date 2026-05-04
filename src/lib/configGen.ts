@@ -17,9 +17,15 @@ export async function regenerateConfig(): Promise<void> {
     const routes   = useRouteStore.getState().routes
     const groups   = useServiceGroupStore.getState().groups
     const settings = useSettingsStore.getState().settings
+    const tls      = useTLSStore.getState().config
+
+    // Determine if any route uses HTTPS — if so, enable the HTTPS listener
+    const tlsEnabled = routes.some(r => r.enabled && r.tls !== 'none')
 
     const payload: ProxyConfigPayload = {
       httpPort: settings.httpPort,
+      httpsPort: settings.httpsPort,
+      tlsEnabled,
       routes: routes
         .filter(r => r.enabled)
         .map(r => ({
@@ -30,6 +36,7 @@ export async function regenerateConfig(): Promise<void> {
           matchType: r.matchType,
           pathPrefix: r.pathPrefix,
           stripPathPrefix: r.stripPathPrefix,
+          tls: r.tls,
         })),
       serviceGroups: groups.map(g => ({
         id: g.id,
@@ -42,6 +49,11 @@ export async function regenerateConfig(): Promise<void> {
           status: u.status,
         })),
       })),
+      manualCerts: tls.mode === 'manual'
+        ? tls.certs
+            .filter(c => c.certPath && c.keyPath)
+            .map(c => ({ domain: c.domain, certPath: c.certPath, keyPath: c.keyPath }))
+        : [],
     }
 
     await reloadProxy(payload)
@@ -346,6 +358,6 @@ export function buildTraefikV3YAML({ routes, groups, mw, tls, settings }: BuildA
   return lines.join('\n') + separator + dynLines.join('\n') + '\n'
 }
 
-// Suppress unused warning — indent is available for future use
+// Suppress unused warning — indent and yamlStr are available for future use
 void indent
 void yamlStr
