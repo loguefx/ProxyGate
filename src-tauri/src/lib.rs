@@ -14,6 +14,11 @@ use tls_manager::TlsManager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Install ring as the rustls process-level crypto provider.
+    // Required when using tls-rustls-no-provider with axum-server so that
+    // rustls doesn't panic looking for a default provider at runtime.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(

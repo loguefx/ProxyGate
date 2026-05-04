@@ -35,5 +35,7 @@ rcgen = "0.13"
 x509-parser = "0.16"
 
 # HTTPS server integration for Axum (handles TLS accept loop, ConnectInfo, WebSocket upgrades)
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Use tls-rustls-no-provider to avoid pulling in aws-lc-sys (C lib requiring CMake/NASM).
+# We supply ring ourselves via the rustls "ring" feature + install_default() at startup.
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 
