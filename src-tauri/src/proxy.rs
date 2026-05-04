@@ -284,17 +284,8 @@ impl ProxyManager {
             }
         };
 
-        let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_config(
-            Arc::new(server_config),
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[ProxyGate TLS] Cannot build RustlsConfig: {}", e);
-                return;
-            }
-        };
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
 
         let mgr = self.clone();
         let handle = tokio::spawn(async move {

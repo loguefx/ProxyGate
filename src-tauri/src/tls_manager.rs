@@ -73,10 +73,12 @@ impl TlsManager {
     /// Build a rustls ServerConfig using this manager's SNI resolver.
     pub fn build_server_config(&self) -> Result<ServerConfig, rustls::Error> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
             .with_no_client_auth()
             .with_cert_resolver(self.resolver.clone());
+        // Advertise HTTP/1.1 and HTTP/2 via ALPN so browsers negotiate correctly
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(config)
     }
 
