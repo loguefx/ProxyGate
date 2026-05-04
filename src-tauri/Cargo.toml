@@ -34,8 +34,6 @@ instant-acme = "0.7"
 rcgen = "0.13"
 x509-parser = "0.16"
 
-# Low-level HTTP serving for the TLS accept loop
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-tower = "0.4"
+# HTTPS server integration for Axum (handles TLS accept loop, ConnectInfo, WebSocket upgrades)
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 

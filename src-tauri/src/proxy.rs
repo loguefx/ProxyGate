@@ -3,13 +3,13 @@ use axum::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
         ConnectInfo, FromRequestParts, Request, State,
     },
+    middleware::Next,
     response::{IntoResponse, Response},
     Router,
 };
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use http::{HeaderName, HeaderValue, StatusCode};
-use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,9 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{broadcast, Mutex, RwLock};
-use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
-use tower::ServiceExt;
 
 use crate::tls_manager::TlsManager;
 
@@ -286,61 +284,35 @@ impl ProxyManager {
             }
         };
 
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
-        let mgr = self.clone();
+        let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_config(
+            Arc::new(server_config),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[ProxyGate TLS] Cannot build RustlsConfig: {}", e);
+                return;
+            }
+        };
 
+        let mgr = self.clone();
         let handle = tokio::spawn(async move {
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
-            let listener = match tokio::net::TcpListener::bind(addr).await {
-                Ok(l) => {
-                    println!("[ProxyGate] HTTPS proxy listening on :{}", port);
-                    l
-                }
-                Err(e) => {
-                    eprintln!("[ProxyGate TLS] Cannot bind HTTPS port {}: {}", port, e);
-                    return;
-                }
-            };
 
+            // Middleware layer that stamps every HTTPS request with IsHttps
             let app = Router::new()
                 .fallback(proxy_handler)
+                .layer(axum::middleware::from_fn(mark_https_request))
                 .with_state(mgr.clone());
 
-            loop {
-                let (tcp_stream, peer_addr) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("[ProxyGate TLS] Accept error: {}", e);
-                        continue;
-                    }
-                };
+            println!("[ProxyGate] HTTPS proxy listening on :{}", port);
 
-                let acceptor = acceptor.clone();
-                let app = app.clone();
-
-                tokio::spawn(async move {
-                    let tls_stream = match acceptor.accept(tcp_stream).await {
-                        Ok(s) => s,
-                        Err(_) => return, // normal for rejected/invalid TLS handshakes
-                    };
-
-                    let io = TokioIo::new(tls_stream);
-
-                    let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
-                        req.extensions_mut().insert(ConnectInfo(peer_addr));
-                        req.extensions_mut().insert(IsHttps);
-                        let app = app.clone();
-                        async move {
-                            let req = req.map(axum::body::Body::new);
-                            app.oneshot(req).await
-                        }
-                    });
-
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .with_upgrades()
-                        .await;
-                });
+            if let Err(e) = axum_server::bind_rustls(addr, rustls_config)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+            {
+                eprintln!("[ProxyGate TLS] HTTPS serve error: {}", e);
             }
         });
 
@@ -506,6 +478,14 @@ async fn proxy_handler(
     let _ = route_tls; // used for redirect logic above; suppress unused warning
     emit_log(&mgr, start, status, &method, &host, &path);
     resp
+}
+
+// ─── HTTPS middleware — stamps every request that arrived over TLS ────────────
+
+async fn mark_https_request(req: Request, next: Next) -> Response {
+    let mut req = req;
+    req.extensions_mut().insert(IsHttps);
+    next.run(req).await
 }
 
 // ─── Landing page — served when no route matches (e.g. IP:port direct access) ─
