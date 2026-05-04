@@ -34,6 +34,7 @@ pub struct CertInfo {
 
 // ─── SNI resolver — looks up the right cert per incoming hostname ─────────────
 
+#[derive(Debug)]
 struct DynamicCertResolver {
     /// Sync RwLock because ResolvesServerCert::resolve is sync
     certs: Arc<RwLock<HashMap<String, Arc<CertifiedKey>>>>,
@@ -413,7 +414,7 @@ impl TlsManager {
 
         emit("save", "Saving certificate…");
 
-        let (cert_path, key_path) = self
+        let (cert_path, _key_path) = self
             .write_and_load_cert(&domain, &cert_chain_pem, &key_pem)
             .await?;
 

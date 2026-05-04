@@ -2,6 +2,8 @@ mod commands;
 mod proxy;
 mod tls_manager;
 
+use tauri::Manager;
+
 use commands::{
     config::{get_config_path, validate_config, write_config},
     health::check_upstream_health,
