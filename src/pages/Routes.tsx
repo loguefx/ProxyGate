@@ -138,6 +138,7 @@ export default function Routes() {
     } catch (e) {
       toast.error(`Failed to save route: ${e}`)
     }
+  }
 
   function handleNewGroup() {
     setModalOpen(false)
